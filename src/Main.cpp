@@ -40,6 +40,7 @@
 #define LOOP_PERIOD 4000  // 4ms
 
 #define Console Serial
+volatile bool intFlag = false;
 
 int gyro_address = 0x68;           // MPU-6050 I2C address (0x68 or 0x69)
 int acc_calibration_value = 1000;  // Enter the accelerometer calibration value
@@ -72,7 +73,7 @@ float angle_gyro, angle_acc, self_balance_pid_setpoint;
 float gyro_input;
 float pid_error_temp, pid_i_mem, pid_setpoint, pid_output, pid_last_d_error;
 float pid_output_left, pid_output_right;
-
+void stepping();
 //
 #include <SoftwareSerial.h>
 
@@ -149,16 +150,6 @@ void setup() {
   Wire.begin();  // Start the I2C bus as master
   TWBR = 12;     // Set the I2C clock speed to 400kHz
 
-  // To create a variable pulse for controlling the stepper motors a timer is created that will execute a piece of code (subroutine) every 20us
-  // This subroutine is called TIMER2_COMPA_vect
-
-  TCCR2A = 0;               // Make sure that the TCCR2A register is set to zero
-  TCCR2B = 0;               // Make sure that the TCCR2A register is set to zero
-  TIMSK2 |= (1 << OCIE2A);  // Set the interupt enable bit OCIE2A in the TIMSK2 register
-  TCCR2B |= (1 << CS21);    // Set the CS21 bit in the TCCRB register to set the prescaler to 8
-  OCR2A = 39;               // The compare register is set to 39 => 20us / (1s / (16.000.000MHz / 8)) - 1
-  TCCR2A |= (1 << WGM21);   // Set counter 2 to CTC (clear timer on compare) mode
-
   // By default the MPU-6050 sleeps. So we have to wake it up.
   Wire.beginTransmission(gyro_address);  // Start communication with the address found during search.
   Wire.write(0x6B);                      // We want to write to the PWR_MGMT_1 register (6B hex)
@@ -192,7 +183,6 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   //
   CommandConsole.begin(38400);
-  CommandConsole.println(F("[IMU calibrating..., wait!]"));
   sCmd.addCommand("kp", handle_kp_cmd);
   sCmd.addCommand("ki", handle_ki_cmd);
   sCmd.addCommand("kd", handle_kd_cmd);
@@ -200,32 +190,43 @@ void setup() {
   sCmd.addCommand("save", handle_save_cmd);
   sCmd.setDefaultHandler(defaultCmdHandle);
 
+  CommandConsole.println(F("[IMU calibrating..., wait!]"));
   Console.println(F("[IMU calibrating..., wait!]"));
   for (receive_counter = 0; receive_counter < 500; receive_counter++) {  // Create 500 loops
-    //if (receive_counter % 15 == 0) digitalWrite(13, !digitalRead(13));   // Change the state of the LED every 15 loops to make the LED blink fast
-    Wire.beginTransmission(gyro_address);                            // Start communication with the gyro
-    Wire.write(0x43);                                                // Start reading the Who_am_I register 75h
-    Wire.endTransmission();                                          // End the transmission
-    Wire.requestFrom(gyro_address, 4);                               // Request 2 bytes from the gyro
-    gyro_yaw_calibration_value += Wire.read() << 8 | Wire.read();    // Combine the two bytes to make one integer
-    gyro_pitch_calibration_value += Wire.read() << 8 | Wire.read();  // Combine the two bytes to make one integer
-    delayMicroseconds(3700);                                         // Wait for 3700 microseconds to simulate the main program loop time
+    Wire.beginTransmission(gyro_address);                                // Start communication with the gyro
+    Wire.write(0x43);                                                    // Start reading the Who_am_I register 75h
+    Wire.endTransmission();                                              // End the transmission
+    Wire.requestFrom(gyro_address, 4);                                   // Request 2 bytes from the gyro
+    gyro_yaw_calibration_value += Wire.read() << 8 | Wire.read();        // Combine the two bytes to make one integer
+    gyro_pitch_calibration_value += Wire.read() << 8 | Wire.read();      // Combine the two bytes to make one integer
+    delayMicroseconds(3700);                                             // Wait for 3700 microseconds to simulate the main program loop time
   }
   gyro_pitch_calibration_value /= 500;  // Divide the total value by 500 to get the avarage gyro offset
   gyro_yaw_calibration_value /= 500;    // Divide the total value by 500 to get the avarage gyro offset
   Console.println(F("[Started]"));
   CommandConsole.println(F("[started]"));
 
+  // To create a variable pulse for controlling the stepper motors a timer is created that will execute a piece of code (subroutine) every 20us
+  // This subroutine is called TIMER2_COMPA_vect
+  TCCR2A = 0;               // Make sure that the TCCR2A register is set to zero
+  TCCR2B = 0;               // Make sure that the TCCR2A register is set to zero
+  TIMSK2 |= (1 << OCIE2A);  // Set the interupt enable bit OCIE2A in the TIMSK2 register
+  TCCR2B |= (1 << CS21);    // Set the CS21 bit in the TCCRB register to set the prescaler to 8
+  OCR2A = 39;               // The compare register is set to 39 => 20us / (1s / (16.000.000MHz / 8)) - 1
+  TCCR2A |= (1 << WGM21);   // Set counter 2 to CTC (clear timer on compare) mode
+  //
   loop_timer = micros() + LOOP_PERIOD;  // Set the loop_timer variable at the next end loop time
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Main program loop
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void loop() {
   sCmd.readSerial();
+  if (intFlag) stepping();
   if (loop_timer <= micros()) return;
-
+  //
   if (Console.available()) {         // If there is serial data available
     received_byte = Console.read();  // Load the received serial data in the received_byte variable
     receive_counter = 0;             // Reset the receive_counter variable
@@ -412,8 +413,14 @@ void loop() {
 // Interrupt routine  TIMER2_COMPA_vect
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 ISR(TIMER2_COMPA_vect) {
+  if (intFlag) return;
+  intFlag = true;
+}
+
+void stepping() {
   static int throttle_left_motor_memory = 0;
   static int throttle_right_motor_memory = 0;
+
   // Left motor pulse calculations
   throttle_counter_left_motor++;                                   // Increase the throttle_counter_left_motor variable by 1 every time this routine is executed
   if (throttle_counter_left_motor > throttle_left_motor_memory) {  // If the number of loops is larger then the throttle_left_motor_memory variable
@@ -447,4 +454,5 @@ ISR(TIMER2_COMPA_vect) {
   } else if (throttle_counter_right_motor == 2) {
     digitalWrite(Y_RIGHT_MOTOR_STEP, LOW);  // Set output 4 low because the pulse only has to last for 20us
   }
+  intFlag = false;
 }
