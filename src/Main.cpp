@@ -12,7 +12,14 @@
 ///////////////////////////////////////////////////////////////////////////////////////
 #include <Arduino.h>
 #include <Wire.h>  //Include the Wire.h library so we can communicate with the gyro
-
+//
+#define COMMAND_SET                  \
+  F("Commands:\n"                    \
+    "kp [value] : set kp to value\n" \
+    "ki [value] : set ki to value\n" \
+    "kd [value] : set kd to value\n" \
+    "pid : print kp, ki, kd\n"       \
+    "")
 // CNC Shield
 // http://www.taichi-maker.com/homepage/reference-index/motor-reference-index/arduino-cnc-shield/
 // https://www.zyltech.com/arduino-cnc-shield-instructions/
@@ -68,18 +75,83 @@ float pid_output_left, pid_output_right;
 
 //
 #include <SoftwareSerial.h>
-SoftwareSerial softSerial(RX_PIN, TX_PIN);
+
+#include <SerialCommand.hpp>
+SoftwareSerial CommandConsole(RX_PIN, TX_PIN);
+SerialCommand<SoftwareSerial, HardwareSerial> sCmd(CommandConsole, Console);
+
+inline void printPID() {
+  CommandConsole.println("kp " + String(pid_p_gain) +
+                         ", ki " + String(pid_i_gain) +
+                         ", kd " + String(pid_d_gain));
+}
+
+int handle_arg_int(char *args) {
+  if (args == NULL) return -1;
+  auto j = atoi(args);
+  return j;
+}
+
+bool handle_arg_float(char *args, float *value) {
+  if (args == NULL) return false;
+  *value = atof(args);
+  return true;
+}
+
+void handle_kp_cmd(void) {
+  float value;
+  if (handle_arg_float(sCmd.next(), &value)) {
+    pid_p_gain = value;
+    printPID();
+    return;
+  }
+  CommandConsole.println(F("bad"));
+}
+
+void handle_ki_cmd(void) {
+  float value;
+  if (handle_arg_float(sCmd.next(), &value)) {
+    pid_i_gain = value;
+    printPID();
+    return;
+  }
+  CommandConsole.println(F("bad"));
+}
+
+void handle_kd_cmd(void) {
+  float value;
+  if (handle_arg_float(sCmd.next(), &value)) {
+    pid_d_gain = value;
+    printPID();
+    return;
+  }
+  CommandConsole.println(F("bad"));
+}
+
+void handle_pid_cmd(void) {
+  printPID();
+}
+
+void handle_save_cmd(void) {
+  CommandConsole.println(F("ok"));
+}
+
+void defaultCmdHandle(const char *command) {
+  CommandConsole.println(COMMAND_SET);
+}
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Setup basic functions
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void setup() {
-  softSerial.begin(38400);  // Start the serial port at 38400 kbps
   Console.begin(115200);
+  //
   Wire.begin();  // Start the I2C bus as master
   TWBR = 12;     // Set the I2C clock speed to 400kHz
 
   // To create a variable pulse for controlling the stepper motors a timer is created that will execute a piece of code (subroutine) every 20us
   // This subroutine is called TIMER2_COMPA_vect
+
   TCCR2A = 0;               // Make sure that the TCCR2A register is set to zero
   TCCR2B = 0;               // Make sure that the TCCR2A register is set to zero
   TIMSK2 |= (1 << OCIE2A);  // Set the interupt enable bit OCIE2A in the TIMSK2 register
@@ -118,31 +190,45 @@ void setup() {
   pinMode(A_RIGHT_MOTOR_DIR, OUTPUT);
 
   pinMode(LED_BUILTIN, OUTPUT);
+  //
+  CommandConsole.begin(38400);
+  CommandConsole.println(F("[IMU calibrating..., wait!]"));
+  sCmd.addCommand("kp", handle_kp_cmd);
+  sCmd.addCommand("ki", handle_ki_cmd);
+  sCmd.addCommand("kd", handle_kd_cmd);
+  sCmd.addCommand("pid", handle_pid_cmd);
+  sCmd.addCommand("save", handle_save_cmd);
+  sCmd.setDefaultHandler(defaultCmdHandle);
 
+  Console.println(F("[IMU calibrating..., wait!]"));
   for (receive_counter = 0; receive_counter < 500; receive_counter++) {  // Create 500 loops
-    if (receive_counter % 15 == 0) digitalWrite(13, !digitalRead(13));   // Change the state of the LED every 15 loops to make the LED blink fast
-    Wire.beginTransmission(gyro_address);                                // Start communication with the gyro
-    Wire.write(0x43);                                                    // Start reading the Who_am_I register 75h
-    Wire.endTransmission();                                              // End the transmission
-    Wire.requestFrom(gyro_address, 4);                                   // Request 2 bytes from the gyro
-    gyro_yaw_calibration_value += Wire.read() << 8 | Wire.read();        // Combine the two bytes to make one integer
-    gyro_pitch_calibration_value += Wire.read() << 8 | Wire.read();      // Combine the two bytes to make one integer
-    delayMicroseconds(3700);                                             // Wait for 3700 microseconds to simulate the main program loop time
+    //if (receive_counter % 15 == 0) digitalWrite(13, !digitalRead(13));   // Change the state of the LED every 15 loops to make the LED blink fast
+    Wire.beginTransmission(gyro_address);                            // Start communication with the gyro
+    Wire.write(0x43);                                                // Start reading the Who_am_I register 75h
+    Wire.endTransmission();                                          // End the transmission
+    Wire.requestFrom(gyro_address, 4);                               // Request 2 bytes from the gyro
+    gyro_yaw_calibration_value += Wire.read() << 8 | Wire.read();    // Combine the two bytes to make one integer
+    gyro_pitch_calibration_value += Wire.read() << 8 | Wire.read();  // Combine the two bytes to make one integer
+    delayMicroseconds(3700);                                         // Wait for 3700 microseconds to simulate the main program loop time
   }
   gyro_pitch_calibration_value /= 500;  // Divide the total value by 500 to get the avarage gyro offset
   gyro_yaw_calibration_value /= 500;    // Divide the total value by 500 to get the avarage gyro offset
+  Console.println(F("[Started]"));
+  CommandConsole.println(F("[started]"));
 
   loop_timer = micros() + LOOP_PERIOD;  // Set the loop_timer variable at the next end loop time
-  Console.println("[Started]");
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Main program loop
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 void loop() {
-  if (softSerial.available()) {         // If there is serial data available
-    received_byte = softSerial.read();  // Load the received serial data in the received_byte variable
-    receive_counter = 0;                // Reset the receive_counter variable
+  sCmd.readSerial();
+  if (loop_timer <= micros()) return;
+
+  if (Console.available()) {         // If there is serial data available
+    received_byte = Console.read();  // Load the received serial data in the received_byte variable
+    receive_counter = 0;             // Reset the receive_counter variable
   }
   if (receive_counter <= 25)
     receive_counter++;  // The received byte will be valid for 25 program loops (100 milliseconds)
@@ -316,8 +402,9 @@ void loop() {
   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
   // The angle calculations are tuned for a loop time of 4 milliseconds. To make sure every loop is exactly 4 milliseconds a wait loop
   // is created by setting the loop_timer variable to +4000 microseconds every loop.
-  while (loop_timer > micros())
-    ;
+  // while (loop_timer > micros()) {
+  //     sCmd.readSerial();
+  // }
   loop_timer += LOOP_PERIOD;
 }
 
